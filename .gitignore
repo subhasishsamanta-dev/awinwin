@@ -96,4 +96,4 @@ status.json
 
 # Logs
 logs/
-*.log
+*.logarchives/
