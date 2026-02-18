@@ -75,7 +75,53 @@ public class SwedishPlayersExtractor {
         Gson gson = new GsonBuilder().serializeNulls().create();
 
         try {
-            // We'll follow pagination when the date block continues on "Next" pages.
+            // --- LOGIN AND GET FRESH TOKENS ---
+            String email = System.getenv("EP_EMAIL");
+            String password = System.getenv("EP_PASSWORD");
+            boolean loginSuccess = false;
+            
+            if (email != null && password != null) {
+                try {
+                    System.out.println("Logging in to get fresh authentication tokens...");
+                    JsonObject loginResp = EliteProspectsAPI.loginAndGetTokens(email, password);
+                    String token = loginResp.has("token") ? loginResp.get("token").getAsString() : null;
+                    String streamToken = loginResp.has("streamToken") ? loginResp.get("streamToken").getAsString() : null;
+                    
+                    // Store fresh cookies in cookiesStore
+                    if (token != null) {
+                        cookiesStore.put("ep_next_token", token);
+                    }
+                    if (streamToken != null) {
+                        cookiesStore.put("streamToken", streamToken);
+                    }
+                    System.out.println("✓ Fresh authentication tokens obtained successfully!");
+                    loginSuccess = true;
+                } catch (Exception e) {
+                    System.err.println("Warning: Failed to get fresh tokens via API login: " + e.getMessage());
+                    System.err.println("Falling back to EP_COOKIE_HEADER environment variable...");
+                }
+            }
+            
+            // If API login failed or credentials not set, try to use EP_COOKIE_HEADER
+            if (!loginSuccess && COOKIE_HEADER != null && !COOKIE_HEADER.isEmpty()) {
+                System.out.println("Using fresh cookies from EP_COOKIE_HEADER environment variable...");
+                // Parse cookies from COOKIE_HEADER format (e.g., "cookie1=value1; cookie2=value2")
+                String[] cookiePairs = COOKIE_HEADER.split(";");
+                for (String pair : cookiePairs) {
+                    pair = pair.trim();
+                    if (!pair.isEmpty() && pair.contains("=")) {
+                        String[] parts = pair.split("=", 2);
+                        if (parts.length == 2) {
+                            cookiesStore.put(parts[0].trim(), parts[1].trim());
+                        }
+                    }
+                }
+                System.out.println("✓ Fresh cookies loaded from environment variable!");
+            } else if (!loginSuccess) {
+                System.out.println("Note: No fresh credentials available. Will attempt anonymous fetch for basic cookies.");
+            }
+
+            System.out.println("\n🚀 Starting extraction from games page...\n");
             // compute yesterday in UTC (site uses UTC timestamps like
             // 2026-02-02T12:00:00+00:00)
             LocalDate targetDate = LocalDate.now(ZoneOffset.UTC).minusDays(1);
@@ -228,14 +274,14 @@ public class SwedishPlayersExtractor {
                             Element lastRow = gameRows.get(gameRows.size() - 1);
                             Element nextSibling = lastRow.nextElementSibling();
                             
-                            // Check if next sibling is a different date header (means Feb 3rd ended)
+                            // Check if next sibling is a different date header (means yesterday's games ended)
                             boolean hitDifferentDate = (nextSibling != null) && 
                                                       (nextSibling.hasClass("title") ||
                                                        nextSibling.selectFirst("td[data-date-type=text]") != null);
                             
                             // Only continue to next page if we hit actual page end (null), NOT a different date
                             if (nextSibling == null) {
-                                // True page end - Feb 3rd games may continue on next page
+                                // True page end - yesterday's games may continue on next page
                                 Elements pagLinks = pageDoc.select(".table-pagination a");
                                 for (Element a : pagLinks) {
                                     String t = a.text();
@@ -250,8 +296,8 @@ public class SwedishPlayersExtractor {
                                     }
                                 }
                             } else if (hitDifferentDate) {
-                                // Hit Feb 4th (or another date) - stop immediately
-                                System.out.println("Detected next date header after Feb 3rd games. Stopping pagination.");
+                                // Hit a different date - stop immediately
+                                System.out.println("Detected next date header after " + displayTarget + " games. Stopping pagination.");
                             }
                         }
                     } catch (Exception ex) {
@@ -259,15 +305,15 @@ public class SwedishPlayersExtractor {
                     }
 
                     if (shouldContinue && nextHref != null) {
-                        // Continue to next page to collect more February 3rd games
+                        // Continue to next page to collect more games from yesterday
                         if (!nextHref.startsWith("http"))
                             nextHref = BASE + (nextHref.startsWith("/") ? nextHref : "/" + nextHref);
-                        System.out.println("Continuing to next page (Feb 3rd games may continue): " + nextHref);
+                        System.out.println("Continuing to next page (" + displayTarget + " games may continue): " + nextHref);
                         pageUrl = nextHref;
                         continue;
                     } else {
                         // Stop: Either we hit next date header or no more pages
-                        System.out.println("Completed collecting all February 3rd games.");
+                        System.out.println("Completed collecting all " + displayTarget + " games.");
                         break;
                     }
                 } else {
@@ -344,103 +390,8 @@ public class SwedishPlayersExtractor {
                     if (profile == null)
                         continue;
 
-                    // Build export object with the exact keys requested (preserve order
-                    // semantically)
-                    Map<String, Object> obj = new LinkedHashMap<>();
-                    Object uid;
-                    try {
-                        uid = Integer.parseInt(profile.userId != null ? profile.userId.trim() : playerId);
-                    } catch (Exception ex) {
-                        uid = profile.userId != null ? profile.userId : playerId;
-                    }
-                    obj.put("user_id", uid);
-                    obj.put("nation", profile.nation);
-                    obj.put("name", profile.name);
-                    obj.put("birthdate", profile.dateOfBirth);
-                    obj.put("latest_team", profile.latest_team);
-                    obj.put("profile_link", fullUrl);
-                    obj.put("player_username",
-                            profile.userName != null ? profile.userName : idToSlug.getOrDefault(playerId, ""));
-                    obj.put("dob_profile", profile.dateOfBirth);
-                    obj.put("age", profile.age);
-                    
-                    // Replace dashes with empty strings for API compatibility (API rejects "-")
-                    String placeOfBirth = profile.placeOfBirth != null && !profile.placeOfBirth.equals("-") 
-                        ? profile.placeOfBirth : "";
-                    obj.put("place_of_birth", placeOfBirth);
-                    
-                    // Fix dual nationality - extract first country only
-                    String nationNormalized = profile.nation;
-                    if (nationNormalized != null && nationNormalized.contains("/")) {
-                        // Extract first country from "USA / Sweden" -> "USA"
-                        nationNormalized = nationNormalized.split("/")[0].trim();
-                    }
-                    obj.put("nation_profile", nationNormalized);
-                    obj.put("youth_team", profile.youthTeam);
-
-                    // position: try to attach parsed stats JSON if available, otherwise position string
-                    String positionRaw = profile.position != null ? profile.position : "";
-                    try {
-                        String statsResponse = EliteProspectsAPI.fetchStatsFromAPI(profile.userId);
-                        String parsed = EliteProspectsAPI.parsePlayerStats(profile.position, statsResponse);
-                        // Send position as string (not parsed JSON object)
-                        obj.put("position", parsed);
-                    } catch (Exception ex) {
-                        obj.put("position", positionRaw);
-                    }
-
-                    obj.put("height", profile.height);
-                    obj.put("weight", profile.weight);
-                    
-                    // Always include shoots field (actual value or empty string)
-                    String shoots = profile.shoots;
-                    if (shoots == null || (shoots != null && (shoots.trim().isEmpty() || shoots.equals("-")))) {
-                        shoots = "";
-                    }
-                    obj.put("shoots", shoots != null ? shoots : "");
-                    
-                    obj.put("contract", profile.contract);
-                    
-                    // Player type as string (empty if no data)
-                    String playerTypeStr = "";
-                    if (profile.playerType != null && profile.playerType.length > 0) {
-                        playerTypeStr = String.join("; ", profile.playerType);
-                    }
-                    obj.put("player_type", playerTypeStr);
-                    
-                    obj.put("cap_hit", profile.capHit);
-                    obj.put("cap_hit_image", profile.capHitImage);
-                    obj.put("nhl_rights", profile.nhlRights);
-                    obj.put("drafted", profile.drafted);
-                    obj.put("agency", profile.agency);
-                    obj.put("profile_picture", profile.imageUrl);
-                    obj.put("relation", profile.relation);
-
-                    // Skills as string (empty if no data)
-                    String skillsStr = "";
-                    if (profile.skills != null && profile.skills.length > 0) {
-                        List<String> skillsList = new ArrayList<>();
-                        for (int i = 0; i < profile.skills.length; i++)
-                            skillsList.add(profile.skills[i].toFormattedString());
-                        skillsStr = String.join("; ", skillsList);
-                    }
-                    obj.put("skills", skillsStr);
-
-                    // Highlights as string (empty if no data)
-                    String highlightsStr = "";
-                    if (profile.highlights != null && profile.highlights.length > 0) {
-                        highlightsStr = String.join("; ", profile.highlights);
-                    }
-                    obj.put("highlights", highlightsStr);
-                    
-                    obj.put("status", profile.status);
-                    
-                    // Award as string (same as highlights)
-                    obj.put("award", highlightsStr);
-                    
-                    obj.put("latest_team_position", profile.latest_team_position);
-                    obj.put("season", profile.season);
-
+                    // Build export object using the shared method
+                    LinkedHashMap<String, Object> obj = buildPlayerObject(profile, playerId, fullUrl, idToSlug);
                     String objJson = gson.toJson(obj);
 
                     // Append to JSON-lines file
@@ -570,6 +521,9 @@ public class SwedishPlayersExtractor {
                 System.err.println("Failed to write output.csv: " + ex.getMessage());
             }
 
+            // --- RETRY FAILED PLAYERS ---
+            retryFailedPlayers(status, profilesOut, exportOut, idToSlug);
+
             // Final status save
             status.save();
             System.out.println("[OK] Extraction complete!");
@@ -577,16 +531,8 @@ public class SwedishPlayersExtractor {
             System.out.println("   - Total players scraped: " + status.scrapedPlayerIds.size());
             System.out.println(
                     "Done. URLs saved to recent_swedish_players_urls.txt, profiles to recent_swedish_players_profiles.jsonl and output.csv updated.");
-            
-            // Upload to API if we have scraped players
-            if (status.scrapedPlayerIds.size() > 0) {
-                System.out.println("\n📤 Uploading player data to API...");
-                boolean uploadSuccess = ApiUploader.uploadPlayerData();
-                if (!uploadSuccess) {
-                    System.err.println("[WARN] API upload failed. You can retry manually by running:");
-                    System.err.println("    mvn exec:java -Dexec.mainClass=com.brainium.core.ApiUploader");
-                }
-            }
+            System.out.println("\nTo upload player data to API, run:");
+            System.out.println("    mvn exec:java -Dexec.mainClass=com.brainium.core.ApiUploader");
             
         } catch (Exception e) {
             System.err.println("Error in SwedishPlayersExtractor: " + e.getMessage());
@@ -594,12 +540,229 @@ public class SwedishPlayersExtractor {
         }
     }
 
+    /**
+     * Build player object for JSON export from a PlayerProfile.
+     */
+    private static LinkedHashMap<String, Object> buildPlayerObject(PlayerProfile profile, String playerId, String fullUrl, Map<String, String> idToSlug) {
+        LinkedHashMap<String, Object> obj = new LinkedHashMap<>();
+        Object uid;
+        try {
+            uid = Integer.parseInt(profile.userId != null ? profile.userId.trim() : playerId);
+        } catch (Exception ex) {
+            uid = profile.userId != null ? profile.userId : playerId;
+        }
+        obj.put("user_id", uid);
+        obj.put("nation", profile.nation);
+        obj.put("name", profile.name);
+        obj.put("birthdate", profile.dateOfBirth);
+        obj.put("latest_team", profile.latest_team);
+        obj.put("profile_link", fullUrl);
+        obj.put("player_username",
+                profile.userName != null ? profile.userName : idToSlug.getOrDefault(playerId, ""));
+        obj.put("dob_profile", profile.dateOfBirth);
+        obj.put("age", profile.age);
+        
+        // Replace dashes with empty strings for API compatibility (API rejects "-")
+        String placeOfBirth = profile.placeOfBirth != null && !profile.placeOfBirth.equals("-") 
+            ? profile.placeOfBirth : "";
+        obj.put("place_of_birth", placeOfBirth);
+        
+        // Fix dual nationality - extract first country only
+        String nationNormalized = profile.nation;
+        if (nationNormalized != null && nationNormalized.contains("/")) {
+            // Extract first country from "USA / Sweden" -> "USA"
+            nationNormalized = nationNormalized.split("/")[0].trim();
+        }
+        obj.put("nation_profile", nationNormalized);
+        obj.put("youth_team", profile.youthTeam);
+
+        // position: try to attach parsed stats JSON if available, otherwise position string
+        String positionRaw = profile.position != null ? profile.position : "";
+        try {
+            String statsResponse = EliteProspectsAPI.fetchStatsFromAPI(profile.userId);
+            String parsed = EliteProspectsAPI.parsePlayerStats(profile.position, statsResponse);
+            // Send position as string (not parsed JSON object)
+            obj.put("position", parsed);
+        } catch (Exception ex) {
+            obj.put("position", positionRaw);
+        }
+
+        obj.put("height", profile.height);
+        obj.put("weight", profile.weight);
+        
+        // Always include shoots field (actual value or empty string)
+        String shoots = profile.shoots;
+        if (shoots == null || (shoots != null && (shoots.trim().isEmpty() || shoots.equals("-")))) {
+            shoots = "";
+        }
+        obj.put("shoots", shoots != null ? shoots : "");
+        
+        obj.put("contract", profile.contract);
+        
+        // Player type as string (empty if no data)
+        String playerTypeStr = "";
+        if (profile.playerType != null && profile.playerType.length > 0) {
+            playerTypeStr = String.join("; ", profile.playerType);
+        }
+        obj.put("player_type", playerTypeStr);
+        
+        obj.put("cap_hit", profile.capHit);
+        obj.put("cap_hit_image", profile.capHitImage);
+        obj.put("nhl_rights", profile.nhlRights);
+        obj.put("drafted", profile.drafted);
+        obj.put("agency", profile.agency);
+        obj.put("profile_picture", profile.imageUrl);
+        obj.put("relation", profile.relation);
+
+        // Skills as string (empty if no data)
+        String skillsStr = "";
+        if (profile.skills != null && profile.skills.length > 0) {
+            List<String> skillsList = new ArrayList<>();
+            for (int i = 0; i < profile.skills.length; i++)
+                skillsList.add(profile.skills[i].toFormattedString());
+            skillsStr = String.join("; ", skillsList);
+        }
+        obj.put("skills", skillsStr);
+
+        // Highlights as string (empty if no data)
+        String highlightsStr = "";
+        if (profile.highlights != null && profile.highlights.length > 0) {
+            highlightsStr = String.join("; ", profile.highlights);
+        }
+        obj.put("highlights", highlightsStr);
+        
+        obj.put("status", profile.status);
+        
+        // Award as string (same as highlights)
+        obj.put("award", highlightsStr);
+        
+        obj.put("latest_team_position", profile.latest_team_position);
+        obj.put("season", profile.season);
+
+        return obj;
+    }
+
+    /**
+     * Retry failed players from failed_players.txt file.
+     * Format: playerId,playerUserName,position,timestamp,errorMessage
+     */
+    private static void retryFailedPlayers(SweExtractorStatus status, Path profilesOut, Path exportOut, Map<String, String> idToSlug) {
+        Path failedFile = Path.of("failed_players.txt");
+        if (!Files.exists(failedFile)) {
+            System.out.println("\n[INFO] No failed_players.txt found, skipping retry.");
+            return;
+        }
+
+        System.out.println("\n========================================");
+        System.out.println("🔄 RETRYING FAILED PLAYERS");
+        System.out.println("========================================");
+
+        try {
+            List<String> lines = Files.readAllLines(failedFile, StandardCharsets.UTF_8);
+            if (lines.isEmpty()) {
+                System.out.println("[INFO] failed_players.txt is empty, nothing to retry.");
+                return;
+            }
+
+            System.out.println("Found " + lines.size() + " failed player(s) to retry...");
+
+            int retrySuccess = 0;
+            int retryFailed = 0;
+            List<String> stillFailing = new ArrayList<>();
+            Gson gson = new GsonBuilder().serializeNulls().create();
+
+            for (String line : lines) {
+                if (line.trim().isEmpty()) continue;
+
+                // Parse CSV line: playerId,playerUserName,position,timestamp,errorMessage
+                String[] parts = line.split(",", 5);
+                if (parts.length < 2) {
+                    System.err.println("⚠️  Skipping malformed line: " + line);
+                    stillFailing.add(line);
+                    continue;
+                }
+
+                String playerId = parts[0].trim();
+                String playerUserName = parts[1].trim();
+
+                // Skip if already scraped
+                if (status.isPlayerScraped(playerId)) {
+                    System.out.println("  ⏭️  Player " + playerId + " already scraped, skipping retry.");
+                    retrySuccess++;
+                    continue;
+                }
+
+                // Construct profile URL
+                String fullUrl = BASE + "/player/" + playerId + "/" + playerUserName;
+
+                System.out.println("  🔄 Retrying player: " + playerId + " (" + playerUserName + ")");
+
+                try {
+                    // Add delay to avoid rate limiting
+                    Thread.sleep(1000);
+
+                    PlayerProfile profile = ProfileScapper.getProfile(fullUrl, playerId);
+                    if (profile == null) {
+                        System.err.println("    ❌ Retry failed: profile is null for " + playerId);
+                        stillFailing.add(line);
+                        retryFailed++;
+                        continue;
+                    }
+
+                    // Build JSON object for this player
+                    LinkedHashMap<String, Object> obj = buildPlayerObject(profile, playerId, fullUrl, idToSlug);
+                    String objJson = gson.toJson(obj);
+
+                    // Append to JSONL file
+                    Files.writeString(profilesOut, objJson + System.lineSeparator(), StandardCharsets.UTF_8,
+                            StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+
+                    // Append to JSON array file
+                    appendObjectToJsonArray(exportOut, objJson);
+
+                    // Mark as successfully scraped
+                    status.markPlayerScraped(playerId);
+
+                    System.out.println("    ✓ Retry successful for player " + playerId);
+                    retrySuccess++;
+
+                } catch (Exception ex) {
+                    System.err.println("    ❌ Retry failed for " + playerId + ": " + ex.getMessage());
+                    stillFailing.add(line);
+                    retryFailed++;
+                }
+            }
+
+            System.out.println("\n[RETRY SUMMARY]");
+            System.out.println("  ✓ Successful retries: " + retrySuccess);
+            System.out.println("  ❌ Still failing: " + retryFailed);
+
+            // Update failed_players.txt with only the players that still failed
+            if (stillFailing.isEmpty()) {
+                Files.deleteIfExists(failedFile);
+                System.out.println("  🗑️  All failures resolved! Deleted failed_players.txt");
+            } else {
+                Files.write(failedFile, stillFailing, StandardCharsets.UTF_8,
+                        StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+                System.out.println("  📝 Updated failed_players.txt with " + stillFailing.size() + " remaining failures");
+            }
+
+        } catch (Exception ex) {
+            System.err.println("Error during failed player retry: " + ex.getMessage());
+            ex.printStackTrace();
+        }
+    }
+
     // All static methods below remain inside the class
 
     private static Document fetchDocument(String url) throws IOException {
-        // Ensure we have cookies (initial fetch or login)
-        ensureCookies(url);
+        // Only ensure cookies if cookiesStore is empty (shouldn't happen if login was successful)
+        if (cookiesStore.isEmpty()) {
+            System.out.println("  ⚠️  cookiesStore empty, attempting to collect cookies from fresh fetch...");
+            ensureCookies(url);
+        }
 
+        System.out.println("  📡 Fetching: " + url);
         Connection conn = Jsoup.connect(url)
                 .userAgent(
                         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36")
@@ -627,31 +790,16 @@ public class SwedishPlayersExtractor {
     }
 
     /**
-     * Ensure cookiesStore is populated. If EP_EMAIL/EP_PASSWORD are present attempt
-     * a form login to obtain cookies, otherwise perform a simple GET to collect
-     * cookies.
+     * Ensure cookiesStore is populated. Cookies should already be set from API login
+     * in main() method. This is kept as a safety fallback only.
      */
     private static void ensureCookies(String exampleUrl) {
         if (!cookiesStore.isEmpty())
             return;
 
-        String email = System.getenv("EP_EMAIL");
-        String password = System.getenv("EP_PASSWORD");
-        String loginUrl = System.getenv("LOGIN_URL") != null ? System.getenv("LOGIN_URL")
-                : "https://www.eliteprospects.com/login?previous=" + exampleUrl;
-
-        if (email != null && password != null) {
-            try {
-                Map<String, String> c = loginViaForm(loginUrl, email, password);
-                if (c != null)
-                    cookiesStore.putAll(c);
-                return;
-            } catch (Exception e) {
-                System.err.println("Form login failed: " + e.getMessage() + " — falling back to anonymous fetch");
-            }
-        }
-
-        // anonymous fetch to collect cookies
+        // If we reach here, it means API login failed or wasn't attempted.
+        // Fallback: try anonymous fetch to collect basic session cookies
+        System.err.println("Warning: cookiesStore is empty. Attempting anonymous fetch for basic cookies...");
         try {
             Connection.Response r = Jsoup.connect(exampleUrl)
                     .userAgent("Mozilla/5.0")
@@ -661,68 +809,8 @@ public class SwedishPlayersExtractor {
             cookiesStore.putAll(r.cookies());
         } catch (Exception e) {
             // ignore — we'll try with COOKIE_HEADER only
-            System.err.println("Initial anonymous fetch failed: " + e.getMessage());
+            System.err.println("Anonymous fetch failed: " + e.getMessage() + " — using EP_COOKIE_HEADER only");
         }
-    }
-
-    /**
-     * Very small form login helper: GET login page, try to detect input names, POST
-     * credentials.
-     * Returns cookie map on success.
-     */
-    private static Map<String, String> loginViaForm(String loginPageUrl, String email, String password)
-            throws IOException {
-        Connection.Response loginPageResp = Jsoup.connect(loginPageUrl)
-                .userAgent("Mozilla/5.0")
-                .timeout(15000)
-                .method(Connection.Method.GET)
-                .followRedirects(true)
-                .execute();
-
-        Document loginDoc = loginPageResp.parse();
-        Map<String, String> cookies = new HashMap<>(loginPageResp.cookies());
-
-        Element form = loginDoc.selectFirst("form");
-        String action = loginPageUrl;
-        if (form != null) {
-            String a = form.hasAttr("action") ? form.absUrl("action") : "";
-            if (a != null && !a.isEmpty())
-                action = a;
-        }
-
-        Map<String, String> data = new HashMap<>();
-        if (form != null) {
-            for (Element input : form.select("input[name]")) {
-                String name = input.attr("name");
-                String value = input.hasAttr("value") ? input.attr("value") : "";
-                data.put(name, value);
-            }
-        }
-
-        List<String> emailCandidates = List.of("email", "username", "login", "user");
-        List<String> passwordCandidates = List.of("password", "pass");
-
-        String emailField = data.keySet().stream()
-                .filter(k -> emailCandidates.stream().anyMatch(c -> k.toLowerCase().contains(c))).findFirst()
-                .orElse("email");
-        String passwordField = data.keySet().stream()
-                .filter(k -> passwordCandidates.stream().anyMatch(c -> k.toLowerCase().contains(c))).findFirst()
-                .orElse("password");
-
-        data.put(emailField, email);
-        data.put(passwordField, password);
-
-        Connection.Response postResp = Jsoup.connect(action)
-                .userAgent("Mozilla/5.0")
-                .timeout(15000)
-                .followRedirects(true)
-                .cookies(cookies)
-                .data(data)
-                .method(Connection.Method.POST)
-                .execute();
-
-        cookies.putAll(postResp.cookies());
-        return cookies;
     }
 
     private static void collectFromTeam(String teamHref, Map<String, String> idToSlug, Map<String, String> idToUrl) {
