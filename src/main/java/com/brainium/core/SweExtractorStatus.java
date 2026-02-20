@@ -13,6 +13,13 @@ import java.util.Set;
  * Tracks progress for SwedishPlayersExtractor to enable resume functionality.
  */
 public class SweExtractorStatus {
+        /**
+         * Reset scraped player IDs (for new team).
+         */
+        public void resetScrapedPlayerIds() {
+            scrapedPlayerIds.clear();
+            save();
+        }
     // Teams that have been fully processed
     public Set<String> processedTeams = new HashSet<>();
     

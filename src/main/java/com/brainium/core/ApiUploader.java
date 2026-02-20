@@ -1,3 +1,4 @@
+
 package com.brainium.core;
 
 import com.google.gson.Gson;
@@ -18,10 +19,14 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.time.LocalDate;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.LinkedHashMap;
+import java.util.Locale;
 
 /**
  * Uploads scraped player data to the API endpoint.
@@ -31,7 +36,10 @@ public class ApiUploader {
     private static final String API_BASE_URL = "https://webdev11.mydevfactory.com/nabaruna-sinha/awinwin/public/api/";
     private static final String ENDPOINT = "update-scrap-player-details";
     private static final String FULL_URL = API_BASE_URL + ENDPOINT;
-    private static final String FAILED_URLS_FILE = "Updated_failed_players.txt";
+    private static final String FAILED_URLS_FILE = "failed_player_urls.txt";
+    private static final int NETWORK_RETRIES_PER_BATCH = 3;
+    private static final long NETWORK_RETRY_BACKOFF_MS = 2000L;
+    private static final DateTimeFormatter DOB_FMT = DateTimeFormatter.ofPattern("MMM dd, yyyy", Locale.ENGLISH);
     
     private static final HttpClient httpClient = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(30))
@@ -127,20 +135,30 @@ public class ApiUploader {
                 return false;
             }
             
-            // Always upload all players (no resume/skip)
+            // Track failures from pre-validation and batch upload
+            java.util.List<String> failedPlayerUrls = new java.util.ArrayList<>();
+
+            // Always upload all valid players (no resume/skip)
             Set<String> uploadedIds = new HashSet<>();
             List<JsonElement> pendingPlayers = new ArrayList<>();
             for (int i = 0; i < totalPlayers; i++) {
-                pendingPlayers.add(playersArray.get(i));
+                JsonElement p = playersArray.get(i);
+                if (!sanitizePlayerForUpload(p, failedPlayerUrls)) {
+                    continue;
+                }
+                pendingPlayers.add(p);
             }
             int originalTotal = totalPlayers;
             totalPlayers = pendingPlayers.size();
+            int skippedPlayers = originalTotal - totalPlayers;
 
             // Calculate batches
             int totalBatches = (int) Math.ceil((double) totalPlayers / batchSize);
             
             System.out.println("\n📤 BATCH UPLOAD STRATEGY:");
-            System.out.println("   Total players: " + totalPlayers);
+            System.out.println("   Total players in file: " + originalTotal);
+            System.out.println("   Players selected for upload: " + totalPlayers);
+            System.out.println("   Skipped invalid players: " + skippedPlayers);
             System.out.println("   Batch size: " + batchSize + " players/batch");
             System.out.println("   Total batches: " + totalBatches);
             System.out.println("   Target URL: " + FULL_URL);
@@ -153,7 +171,7 @@ public class ApiUploader {
             int successfulBatches = 0;
             int failedBatches = 0;
             java.util.List<String> failedBatchNumbers = new java.util.ArrayList<>();
-            java.util.List<String> failedPlayerUrls = new java.util.ArrayList<>();
+            
             
             System.out.println("\n" + "═".repeat(64));
             System.out.println("🚀 STARTING BATCH UPLOAD");
@@ -202,84 +220,113 @@ public class ApiUploader {
                 if (!batchPlayerIds.isEmpty()) {
                     System.out.println("   👤 Player IDs: " + String.join(", ", batchPlayerIds));
                 }
-                long startTime = System.currentTimeMillis();
-                
-                try {
-                    // Send request
-                    HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
-                    
-                    long duration = System.currentTimeMillis() - startTime;
-                    int statusCode = response.statusCode();
-                    String responseBody = response.body();
-                    
-                    System.out.println("   📥 Response: " + statusCode + " (" + duration + "ms)");
-                    
-                    if (statusCode >= 200 && statusCode < 300) {
-                        System.out.println("   ✅ Batch " + (batchNum + 1) + " SUCCESS");
-                        successfulBatches++;
-                        if (!batchPlayerIds.isEmpty()) {
-                            uploadedIds.addAll(batchPlayerIds);
-                        }
-                        
-                        // Show response if available
-                        if (responseBody != null && !responseBody.trim().isEmpty() && responseBody.length() < 500) {
-                            System.out.println("   Response: " + responseBody);
-                        }
-                    } else if (statusCode == 422) {
-                        System.err.println("   ❌ Batch " + (batchNum + 1) + " VALIDATION ERROR (HTTP 422)");
-                        
-                        // Parse response to identify which players failed
-                        List<String> failedPlayerUrls_422 = parseValidationErrorResponse(responseBody, batchArray);
-                        if (!failedPlayerUrls_422.isEmpty()) {
-                            failedPlayerUrls.addAll(failedPlayerUrls_422);
-                            System.err.println("   📝 Identified " + failedPlayerUrls_422.size() + " invalid players");
-                            System.err.println("   ⚠️  Invalid players logged to Updated_failed_players.txt");
+                boolean batchHandled = false;
+                for (int attempt = 1; attempt <= NETWORK_RETRIES_PER_BATCH && !batchHandled; attempt++) {
+                    long startTime = System.currentTimeMillis();
+                    try {
+                        // Send request
+                        HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+
+                        long duration = System.currentTimeMillis() - startTime;
+                        int statusCode = response.statusCode();
+                        String responseBody = response.body();
+
+                        System.out.println("   📥 Response: " + statusCode + " (" + duration + "ms)");
+
+                        if (statusCode >= 200 && statusCode < 300) {
+                            System.out.println("   ✅ Batch " + (batchNum + 1) + " SUCCESS");
+                            successfulBatches++;
+                            if (!batchPlayerIds.isEmpty()) {
+                                uploadedIds.addAll(batchPlayerIds);
+                            }
+
+                            // Show response if available
+                            if (responseBody != null && !responseBody.trim().isEmpty() && responseBody.length() < 500) {
+                                System.out.println("   Response: " + responseBody);
+                            }
+                            batchHandled = true;
+                        } else if (statusCode == 422) {
+                            System.err.println("   ❌ Batch " + (batchNum + 1) + " VALIDATION ERROR (HTTP 422)");
+
+                            // Parse response to identify which players failed
+                            List<String> failedPlayerUrls_422 = parseValidationErrorResponse(responseBody, batchArray);
+                            if (!failedPlayerUrls_422.isEmpty()) {
+                                failedPlayerUrls.addAll(failedPlayerUrls_422);
+                                System.err.println("   📝 Identified " + failedPlayerUrls_422.size() + " invalid players");
+                                System.err.println("   ⚠️  Invalid players logged to Updated_failed_players.txt");
+                            } else {
+                                // If we can't parse specific errors, log all URLs from batch
+                                failedPlayerUrls.addAll(extractPlayerUrls(batchArray));
+                                System.err.println("   ⚠️  All players in batch logged to Updated_failed_players.txt");
+                            }
+
+                            failedBatches++;
+                            failedBatchNumbers.add(String.valueOf(batchNum + 1));
+                            System.err.println("   ⚠️  Continuing with next batch...\n");
+                            batchHandled = true;
                         } else {
-                            // If we can't parse specific errors, log all URLs from batch
+                            boolean retryableStatus = statusCode == 429 || statusCode >= 500;
+                            if (retryableStatus && attempt < NETWORK_RETRIES_PER_BATCH) {
+                                long delayMs = NETWORK_RETRY_BACKOFF_MS * attempt;
+                                System.err.println("   ⚠️  Batch " + (batchNum + 1) + " got HTTP " + statusCode
+                                        + ". Retrying in " + delayMs + "ms (" + attempt + "/"
+                                        + NETWORK_RETRIES_PER_BATCH + ")");
+                                sleepQuietly(delayMs);
+                                continue;
+                            }
+
+                            System.err.println("   ❌ Batch " + (batchNum + 1) + " FAILED (HTTP " + statusCode + ")");
+                            failedBatches++;
+                            failedBatchNumbers.add(String.valueOf(batchNum + 1));
                             failedPlayerUrls.addAll(extractPlayerUrls(batchArray));
-                            System.err.println("   ⚠️  All players in batch logged to Updated_failed_players.txt");
+
+                            // Show error response
+                            if (responseBody != null && !responseBody.trim().isEmpty()) {
+                                System.err.println("   Error response: " + responseBody);
+                            }
+
+                            // Provide helpful error messages based on status code
+                            switch (statusCode) {
+                                case 400:
+                                    System.err.println("   💡 Bad Request - Check JSON format");
+                                    break;
+                                case 401:
+                                    System.err.println("   💡 Unauthorized - API authentication required");
+                                    break;
+                                case 403:
+                                    System.err.println("   💡 Forbidden - Check API permissions");
+                                    break;
+                                case 404:
+                                    System.err.println("   💡 Not Found - Check API endpoint URL");
+                                    break;
+                                case 500:
+                                    System.err.println("   💡 Server Error - Server-side issue");
+                                    break;
+                            }
+
+                            System.err.println("   ⚠️  Continuing with next batch...");
+                            batchHandled = true;
                         }
-                        
+
+                    } catch (Exception e) {
+                        boolean retryable = isRetryableTransportException(e) && attempt < NETWORK_RETRIES_PER_BATCH;
+                        if (retryable) {
+                            long delayMs = NETWORK_RETRY_BACKOFF_MS * attempt;
+                            System.err.println("   ⚠️  Batch " + (batchNum + 1) + " network error: " + e.getMessage()
+                                    + ". Retrying in " + delayMs + "ms (" + attempt + "/"
+                                    + NETWORK_RETRIES_PER_BATCH + ")");
+                            sleepQuietly(delayMs);
+                            continue;
+                        }
+
+                        System.err.println("   ❌ Batch " + (batchNum + 1) + " ERROR: " + e.getMessage());
                         failedBatches++;
                         failedBatchNumbers.add(String.valueOf(batchNum + 1));
-                        System.err.println("   ⚠️  Continuing with next batch...\n");
-                    } else {
-                        System.err.println("   ❌ Batch " + (batchNum + 1) + " FAILED (HTTP " + statusCode + ")");
-                        failedBatches++;
-                        failedBatchNumbers.add(String.valueOf(batchNum + 1));
+                        // Ensure timeout/network exceptions also preserve failed player URLs
                         failedPlayerUrls.addAll(extractPlayerUrls(batchArray));
-                        
-                        // Show error response
-                        if (responseBody != null && !responseBody.trim().isEmpty()) {
-                            System.err.println("   Error response: " + responseBody);
-                        }
-                        
-                        // Provide helpful error messages based on status code
-                        switch (statusCode) {
-                            case 400:
-                                System.err.println("   💡 Bad Request - Check JSON format");
-                                break;
-                            case 401:
-                                System.err.println("   💡 Unauthorized - API authentication required");
-                                break;
-                            case 403:
-                                System.err.println("   💡 Forbidden - Check API permissions");
-                                break;
-                            case 404:
-                                System.err.println("   💡 Not Found - Check API endpoint URL");
-                                break;
-                            case 500:
-                                System.err.println("   💡 Server Error - Server-side issue");
-                                break;
-                        }
-                        
-                        System.err.println("   ⚠️  Continuing with next batch...");
+                        System.err.println("   📝 Logged batch player URLs for retry tracking");
+                        batchHandled = true;
                     }
-                    
-                } catch (Exception e) {
-                    System.err.println("   ❌ Batch " + (batchNum + 1) + " ERROR: " + e.getMessage());
-                    failedBatches++;
-                    failedBatchNumbers.add(String.valueOf(batchNum + 1));
                 }
                 
                 // Small delay between batches to avoid overwhelming server
@@ -295,13 +342,13 @@ public class ApiUploader {
             // Write failed player URLs to file
             if (!failedPlayerUrls.isEmpty()) {
                 Set<String> uniqueFailedUrls = new HashSet<>(failedPlayerUrls);
-                try (BufferedWriter writer = new BufferedWriter(new FileWriter(FAILED_URLS_FILE))) {
+                try (BufferedWriter writer = new BufferedWriter(new FileWriter(FAILED_URLS_FILE, true))) { // append mode
                     for (String url : uniqueFailedUrls) {
                         writer.write(url);
                         writer.newLine();
                     }
-                    System.out.println("\n📝 Failed player URLs written to: " + FAILED_URLS_FILE);
-                    System.out.println("   Total failed players: " + uniqueFailedUrls.size());
+                    System.out.println("\n📝 Failed player URLs appended to: " + FAILED_URLS_FILE);
+                    System.out.println("   Total failed players (this run): " + uniqueFailedUrls.size());
                 } catch (IOException e) {
                     System.err.println("⚠️  Warning: Could not write to " + FAILED_URLS_FILE + ": " + e.getMessage());
                 }
@@ -347,6 +394,86 @@ public class ApiUploader {
             return false;
         }
     }
+
+    private static boolean isRetryableTransportException(Exception e) {
+        Throwable t = e;
+        while (t.getCause() != null) {
+            t = t.getCause();
+        }
+        return t instanceof java.net.SocketException
+                || t instanceof java.net.SocketTimeoutException
+                || t instanceof java.net.ConnectException
+                || t instanceof java.net.UnknownHostException
+                || t instanceof java.net.http.HttpTimeoutException
+                || t instanceof IOException;
+    }
+
+    private static void sleepQuietly(long ms) {
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    /**
+     * Normalize player fields to avoid DB type errors. Returns false if record should
+     * be skipped.
+     */
+    private static boolean sanitizePlayerForUpload(JsonElement playerElement, List<String> failedUrls) {
+        if (playerElement == null || !playerElement.isJsonObject()) {
+            return false;
+        }
+        JsonObject player = playerElement.getAsJsonObject();
+
+        if (player.has("age") && !player.get("age").isJsonNull()) {
+            String ageRaw = "";
+            try {
+                ageRaw = player.get("age").getAsString().trim();
+            } catch (Exception ignore) {
+            }
+
+            String digits = ageRaw.replaceAll("[^0-9]", "");
+            if (!digits.isEmpty()) {
+                player.addProperty("age", digits);
+            } else {
+                Integer derivedAge = deriveAgeFromBirthdate(player);
+                if (derivedAge != null) {
+                    player.addProperty("age", derivedAge);
+                } else {
+                    String url = extractPlayerUrl(player);
+                    if (url != null && !url.isBlank()) {
+                        failedUrls.add(url);
+                    }
+                    String id = extractPlayerId(player);
+                    System.err.println("   ⚠️  Skipping player due to invalid age value: user_id=" + id + ", age=" + ageRaw);
+                    return false;
+                }
+            }
+        }
+
+        return true;
+    }
+
+    private static Integer deriveAgeFromBirthdate(JsonObject player) {
+        if (player == null || !player.has("birthdate") || player.get("birthdate").isJsonNull()) {
+            return null;
+        }
+        try {
+            String birthdateRaw = player.get("birthdate").getAsString().trim();
+            if (birthdateRaw.isEmpty() || "-".equals(birthdateRaw) || "?".equals(birthdateRaw)) {
+                return null;
+            }
+            LocalDate dob = LocalDate.parse(birthdateRaw, DOB_FMT);
+            int age = LocalDate.now().getYear() - dob.getYear();
+            if (age < 0 || age > 90) {
+                return null;
+            }
+            return age;
+        } catch (Exception e) {
+            return null;
+        }
+    }
     
     /**
      * Clean up null values for specific fields that the API requires to be non-null.
@@ -389,8 +516,96 @@ public class ApiUploader {
         System.out.println("╚════════════════════════════════════════╝");
         System.out.println();
         
-        boolean success = uploadPlayerData();
-        System.exit(success ? 0 : 1);
+        // Print JVM memory information
+        Runtime runtime = Runtime.getRuntime();
+        long maxMemory = runtime.maxMemory() / (1024 * 1024); // MB
+        long totalMemory = runtime.totalMemory() / (1024 * 1024); // MB
+        System.out.println("JVM Memory Info:");
+        System.out.println("  Max Memory: " + maxMemory + " MB");
+        System.out.println("  Total Memory: " + totalMemory + " MB\n");
+        
+        // --- CHECK IF EXTRACTION COMPLETED SUCCESSFULLY ---
+        Path extractionMarker = Path.of(".extraction_success");
+        if (!Files.exists(extractionMarker)) {
+            System.err.println("❌ ERROR: Extraction did not complete successfully!");
+            System.err.println("   Marker file not found: " + extractionMarker.toAbsolutePath());
+            System.err.println("   Please run SwedishPlayersExtractor first.");
+            terminateProcess(1, "Extraction marker missing");
+        }
+        
+        // --- CREATE LOCK FILE WITH PID ---
+        Path lockFile = Path.of("api_uploader.lock");
+        Path pidFile = Path.of("api_uploader.pid");
+        
+        try {
+            // Check if lock file exists
+            if (Files.exists(lockFile)) {
+                if (Files.exists(pidFile)) {
+                    String oldPid = Files.readString(pidFile).trim();
+                    System.err.println("❌ ApiUploader is already running (PID: " + oldPid + ")");
+                    System.err.println("   Lock file: " + lockFile.toAbsolutePath());
+                    System.err.println("   If this is a stale lock, remove: rm " + lockFile.toAbsolutePath());
+                    terminateProcess(1, "Uploader lock already exists");
+                }
+            }
+            
+            // Create lock file and PID file
+            String pid = String.valueOf(ProcessHandle.current().pid());
+            Files.writeString(lockFile, "LOCKED by PID " + pid + " at " + java.time.LocalDateTime.now());
+            Files.writeString(pidFile, pid);
+            System.out.println("🔒 Lock acquired (PID: " + pid + ") - Lock file: " + lockFile.toAbsolutePath());
+            
+            // Ensure lock file is deleted on JVM shutdown
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                try {
+                    Files.deleteIfExists(lockFile);
+                    Files.deleteIfExists(pidFile);
+                    System.out.println("🔓 Lock released - deleted " + lockFile.toAbsolutePath());
+                } catch (Exception e) {
+                    System.err.println("Warning: Failed to delete lock file: " + e.getMessage());
+                }
+            }));
+        } catch (Exception e) {
+            System.err.println("❌ Failed to create lock file: " + e.getMessage());
+            terminateProcess(1, "Failed to create uploader lock");
+        }
+        
+        boolean success = false;
+        try {
+            success = uploadPlayerData();
+            
+            // Print final memory usage
+            runtime = Runtime.getRuntime();
+            long usedMemory = (runtime.totalMemory() - runtime.freeMemory()) / (1024 * 1024);
+            System.out.println("\nMemory used: " + usedMemory + " MB / " + (runtime.maxMemory() / (1024 * 1024)) + " MB");
+            
+        } catch (OutOfMemoryError e) {
+            System.err.println("\n❌ OUT OF MEMORY ERROR in ApiUploader!");
+            System.err.println("   Heap memory exhausted. Consider:");
+            System.err.println("   1. Increasing -Xmx value in MAVEN_OPTS");
+            System.err.println("   2. Reducing batch size in uploadPlayerData()");
+            System.err.println("   Current settings: -Xmx" + (Runtime.getRuntime().maxMemory() / (1024 * 1024)) + "m");
+            e.printStackTrace();
+            terminateProcess(137, "Out of memory");  // Signal OOM error (128 + 9)
+        } catch (Exception e) {
+            System.err.println("\n❌ UNEXPECTED ERROR in ApiUploader: " + e.getMessage());
+            e.printStackTrace();
+            terminateProcess(1, "Unexpected runtime error");
+        }
+
+        int exitCode = success ? 0 : 1;
+        String reason = success ? "All batches completed" : "One or more batches failed";
+        terminateProcess(exitCode, reason);
+    }
+
+    /**
+     * Print explicit exit details and terminate the JVM with the provided code.
+     */
+    private static void terminateProcess(int exitCode, String reason) {
+        System.out.println("\n🏁 ApiUploader terminating");
+        System.out.println("   Reason: " + reason);
+        System.out.println("   Exit code: " + exitCode);
+        System.exit(exitCode);
     }
 
     private static String extractPlayerId(JsonElement player) {

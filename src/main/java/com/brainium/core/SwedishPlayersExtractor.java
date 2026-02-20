@@ -8,6 +8,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -44,7 +45,7 @@ public class SwedishPlayersExtractor {
 
     private static final String DEFAULT_GAMES_URL = System.getenv("GAMES_URL") != null
             ? System.getenv("GAMES_URL")
-            : "https://www.eliteprospects.com/games/2025-2026/all-leagues/all-teams";
+            : "https://www.eliteprospects.com/games/2025-2026/all-leagues/all-teams?from=&to=&page=2";
 
     // Cookie header reused from ProfileScapper for site access
     // Prefer reading cookie header from environment to avoid escaping issues in
@@ -64,6 +65,64 @@ public class SwedishPlayersExtractor {
     public static void main(String[] args) {
         String gamesUrl = args != null && args.length > 0 ? args[0] : DEFAULT_GAMES_URL;
         System.out.println("Starting SwedishPlayersExtractor for: " + gamesUrl);
+        
+        // Print JVM memory information
+        Runtime runtime = Runtime.getRuntime();
+        long maxMemory = runtime.maxMemory() / (1024 * 1024); // MB
+        long totalMemory = runtime.totalMemory() / (1024 * 1024); // MB
+        System.out.println("JVM Memory Info:");
+        System.out.println("  Max Memory: " + maxMemory + " MB");
+        System.out.println("  Total Memory: " + totalMemory + " MB");
+
+        // --- CREATE LOCK FILE WITH PID ---
+        Path lockFile = Path.of("swedish_extractor.lock");
+        Path pidFile = Path.of("swedish_extractor.pid");
+        
+        try {
+            // If previous lock files exist, verify that the recorded PID is still alive.
+            if (Files.exists(lockFile) || Files.exists(pidFile)) {
+                if (Files.exists(pidFile)) {
+                    String oldPidRaw = Files.readString(pidFile).trim();
+                    try {
+                        long oldPid = Long.parseLong(oldPidRaw);
+                        boolean running = ProcessHandle.of(oldPid).map(ProcessHandle::isAlive).orElse(false);
+                        if (running) {
+                            System.err.println("❌ SwedishPlayersExtractor is already running (PID: " + oldPid + ")");
+                            System.err.println("   Lock file: " + lockFile.toAbsolutePath());
+                            System.err.println("   If this is a stale lock, remove: rm " + lockFile.toAbsolutePath());
+                            System.exit(1);
+                        }
+                        System.out.println("ℹ️ Found stale lock for dead PID " + oldPid + ". Removing stale lock files.");
+                    } catch (NumberFormatException nfe) {
+                        System.out.println("ℹ️ Found invalid PID in lock file: '" + oldPidRaw + "'. Removing stale lock files.");
+                    }
+                } else {
+                    System.out.println("ℹ️ Found lock file without PID file. Removing stale lock file.");
+                }
+                Files.deleteIfExists(lockFile);
+                Files.deleteIfExists(pidFile);
+            }
+
+            // Create lock file and PID file for this process.
+            String pid = String.valueOf(ProcessHandle.current().pid());
+            Files.writeString(lockFile, "LOCKED by PID " + pid + " at " + java.time.LocalDateTime.now());
+            Files.writeString(pidFile, pid);
+            System.out.println("🔒 Lock acquired (PID: " + pid + ") - Lock file: " + lockFile.toAbsolutePath());
+            
+            // Ensure lock file is deleted on JVM shutdown
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                try {
+                    Files.deleteIfExists(lockFile);
+                    Files.deleteIfExists(pidFile);
+                    System.out.println("🔓 Lock released - deleted " + lockFile.toAbsolutePath());
+                } catch (Exception e) {
+                    System.err.println("Warning: Failed to delete lock file: " + e.getMessage());
+                }
+            }));
+        } catch (Exception e) {
+            System.err.println("❌ Failed to create lock file: " + e.getMessage());
+            System.exit(1);
+        }
 
         // Load status for resume functionality
         SweExtractorStatus status = SweExtractorStatus.load();
@@ -237,6 +296,7 @@ public class SwedishPlayersExtractor {
                                 
                                 if (!status.isTeamProcessed(full)) {
                                     status.setCurrentTeam(full);
+                                    status.resetScrapedPlayerIds();
                                     collectFromTeam(href, idToSlug, idToUrl);
                                     status.markTeamProcessed(full);
                                 } else {
@@ -369,54 +429,104 @@ public class SwedishPlayersExtractor {
                 System.err.println("Failed to write team.txt: " + ex.getMessage());
             }
 
-            // Scrape full profiles one-by-one and immediately persist them in two forms:
-            // 1) JSON-lines file `recent_swedish_players_profiles.jsonl` (append)
-            // 2) JSON array file `recent_swedish_players_data.json` (append-safe helper)
+            // Scrape and persist each player profile only once, then exit
             Path profilesOut = Path.of("recent_swedish_players_profiles.jsonl");
             Path exportOut = Path.of("recent_swedish_players_data.json");
-
+            Set<String> alreadyWritten = new HashSet<>();
+            if (Files.exists(profilesOut)) {
+                try {
+                    List<String> lines = Files.readAllLines(profilesOut, StandardCharsets.UTF_8);
+                    for (String line : lines) {
+                        // Try to parse the user_id field from each JSON line
+                        String id = null;
+                        int idx = line.indexOf("\"user_id\":");
+                        if (idx != -1) {
+                            // Try to extract the value after "user_id":
+                            String rest = line.substring(idx + 10).trim();
+                            // Remove leading spaces and possible colon
+                            rest = rest.replaceFirst("^[^0-9\"]*", "");
+                            // user_id can be a number or a quoted string
+                            if (rest.startsWith("\"")) {
+                                // Quoted string
+                                int endIdx = rest.indexOf('"', 1);
+                                if (endIdx > 1) {
+                                    id = rest.substring(1, endIdx);
+                                }
+                            } else {
+                                // Number (until comma or end)
+                                int endIdx = rest.indexOf(',');
+                                if (endIdx == -1) endIdx = rest.indexOf('}');
+                                if (endIdx > 0) {
+                                    id = rest.substring(0, endIdx).replaceAll("[^0-9]", "");
+                                } else {
+                                    id = rest.replaceAll("[^0-9]", "");
+                                }
+                            }
+                        }
+                        if (id != null && !id.isEmpty()) {
+                            alreadyWritten.add(id);
+                        }
+                    }
+                } catch (Exception ex) {
+                    System.err.println("Deduplication preload failed: " + ex.getMessage());
+                }
+            }
             for (Map.Entry<String, String> e : idToUrl.entrySet()) {
                 String playerId = e.getKey();
                 String fullUrl = e.getValue();
-                
-                // Skip if player already scraped
-                if (status.isPlayerScraped(playerId)) {
-                    System.out.println("  ⏭️  Skipping already scraped player: " + playerId);
+                if (status.isPlayerScraped(playerId) || alreadyWritten.contains(playerId)) {
+                    System.out.println("  ⏭️  Skipping already scraped or written player: " + playerId);
                     continue;
                 }
-                
                 try {
                     PlayerProfile profile = ProfileScapper.getProfile(fullUrl, playerId);
-                    if (profile == null)
+                    if (profile == null) {
+                        // Save failed player URL to failed_player_urls.txt
+                        try {
+                            Path failedFile = Path.of("failed_player_urls.txt");
+                            Files.writeString(failedFile, fullUrl + System.lineSeparator(), StandardCharsets.UTF_8,
+                                    StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+                        } catch (Exception ignored) {}
                         continue;
-
-                    // Build export object using the shared method
+                    }
                     LinkedHashMap<String, Object> obj = buildPlayerObject(profile, playerId, fullUrl, idToSlug);
                     String objJson = gson.toJson(obj);
-
-                    // Append to JSON-lines file
                     try {
                         Files.writeString(profilesOut, objJson + System.lineSeparator(), StandardCharsets.UTF_8,
                                 StandardOpenOption.CREATE, StandardOpenOption.APPEND);
                     } catch (Exception ex) {
                         System.err.println("Failed to append profile jsonl for " + fullUrl + " : " + ex.getMessage());
                     }
-
-                    // Append to JSON array file safely
                     try {
                         appendObjectToJsonArray(exportOut, objJson);
                     } catch (Exception ex) {
                         System.err.println("Failed to append to recent_swedish_players_data.json for " + fullUrl + " : "
                                 + ex.getMessage());
                     }
-
-                    // Mark player as successfully scraped
                     status.markPlayerScraped(playerId);
-
                 } catch (Exception ex) {
                     System.err.println("Failed to scrape profile for " + fullUrl + " : " + ex.getMessage());
+                    try {
+                        Path failedFile = Path.of("failed_player_urls.txt");
+                        Files.writeString(failedFile, fullUrl + System.lineSeparator(), StandardCharsets.UTF_8,
+                                StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+                    } catch (Exception ignored) {}
                 }
             }
+            // After all profiles are scraped, exit immediately
+            status.save();
+            try {
+                Files.writeString(Path.of(".extraction_success"), 
+                    "Extraction completed at " + java.time.LocalDateTime.now() + "\n" +
+                    "Total players scraped: " + status.scrapedPlayerIds.size() + "\n",
+                    StandardCharsets.UTF_8,
+                    StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+                System.out.println("✅ Extraction success marker created: .extraction_success");
+            } catch (Exception ex) {
+                System.err.println("Warning: Failed to create success marker: " + ex.getMessage());
+            }
+            System.out.println("[OK] Extraction complete! Exiting now.");
+            System.exit(0);
 
             // Also append rows to the main `output.csv` including the Position JSON column
             try {
@@ -526,17 +636,75 @@ public class SwedishPlayersExtractor {
 
             // Final status save
             status.save();
-            System.out.println("[OK] Extraction complete!");
+            
+            // Create success marker file for ApiUploader
+            try {
+                Files.writeString(Path.of(".extraction_success"), 
+                    "Extraction completed at " + java.time.LocalDateTime.now() + "\n" +
+                    "Total players scraped: " + status.scrapedPlayerIds.size() + "\n",
+                    StandardCharsets.UTF_8,
+                    StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+                System.out.println("✅ Extraction success marker created: .extraction_success");
+            } catch (Exception ex) {
+                System.err.println("Warning: Failed to create success marker: " + ex.getMessage());
+            }
+            
+            // Print final memory usage
+            runtime = Runtime.getRuntime();
+            long usedMemory = (runtime.totalMemory() - runtime.freeMemory()) / (1024 * 1024);
+            System.out.println("\n[OK] Extraction complete!");
             System.out.println("   - Total teams processed: " + status.processedTeams.size());
             System.out.println("   - Total players scraped: " + status.scrapedPlayerIds.size());
+            System.out.println("   - Memory used: " + usedMemory + " MB / " + (runtime.maxMemory() / (1024 * 1024)) + " MB");
             System.out.println(
                     "Done. URLs saved to recent_swedish_players_urls.txt, profiles to recent_swedish_players_profiles.jsonl and output.csv updated.");
             System.out.println("\nTo upload player data to API, run:");
             System.out.println("    mvn exec:java -Dexec.mainClass=com.brainium.core.ApiUploader");
             
-        } catch (Exception e) {
-            System.err.println("Error in SwedishPlayersExtractor: " + e.getMessage());
+            System.exit(0);
+            
+        } catch (OutOfMemoryError e) {
+            System.err.println("❌ OUT OF MEMORY ERROR in SwedishPlayersExtractor!");
+            System.err.println("   Heap memory exhausted. Consider:");
+            System.err.println("   1. Increasing -Xmx value in MAVEN_OPTS");
+            System.err.println("   2. Processing fewer teams/players per batch");
+            System.err.println("   Current settings: -Xmx" + (Runtime.getRuntime().maxMemory() / (1024 * 1024)) + "m");
             e.printStackTrace();
+            
+            // Clean up partial files
+            cleanupPartialFiles();
+            System.exit(137);  // Signal OOM error (128 + 9 = kill signal for OOM)
+        } catch (Exception e) {
+            System.err.println("❌ FATAL ERROR in SwedishPlayersExtractor: " + e.getMessage());
+            e.printStackTrace();
+            
+            // Clean up partial files
+            cleanupPartialFiles();
+            System.exit(1);  // Signal failure to bash script
+        }
+    }
+    
+    /**
+     * Clean up potentially incomplete files when extraction fails.
+     */
+    private static void cleanupPartialFiles() {
+        try {
+            System.out.println("🧹 Cleaning up potentially incomplete files...");
+            Path[] filesToCleanup = {
+                Path.of("recent_swedish_players_data.json"),
+                Path.of("recent_swedish_players_profiles.jsonl"),
+                Path.of("recent_swedish_players_ids.txt"),
+                Path.of("recent_swedish_players_urls.txt")
+            };
+            
+            for (Path file : filesToCleanup) {
+                if (Files.exists(file)) {
+                    Files.delete(file);
+                    System.out.println("   Deleted: " + file.getFileName());
+                }
+            }
+        } catch (Exception e) {
+            System.err.println("Warning: Failed to clean up some files: " + e.getMessage());
         }
     }
 
@@ -647,110 +815,7 @@ public class SwedishPlayersExtractor {
      * Format: playerId,playerUserName,position,timestamp,errorMessage
      */
     private static void retryFailedPlayers(SweExtractorStatus status, Path profilesOut, Path exportOut, Map<String, String> idToSlug) {
-        Path failedFile = Path.of("failed_players.txt");
-        if (!Files.exists(failedFile)) {
-            System.out.println("\n[INFO] No failed_players.txt found, skipping retry.");
-            return;
-        }
-
-        System.out.println("\n========================================");
-        System.out.println("🔄 RETRYING FAILED PLAYERS");
-        System.out.println("========================================");
-
-        try {
-            List<String> lines = Files.readAllLines(failedFile, StandardCharsets.UTF_8);
-            if (lines.isEmpty()) {
-                System.out.println("[INFO] failed_players.txt is empty, nothing to retry.");
-                return;
-            }
-
-            System.out.println("Found " + lines.size() + " failed player(s) to retry...");
-
-            int retrySuccess = 0;
-            int retryFailed = 0;
-            List<String> stillFailing = new ArrayList<>();
-            Gson gson = new GsonBuilder().serializeNulls().create();
-
-            for (String line : lines) {
-                if (line.trim().isEmpty()) continue;
-
-                // Parse CSV line: playerId,playerUserName,position,timestamp,errorMessage
-                String[] parts = line.split(",", 5);
-                if (parts.length < 2) {
-                    System.err.println("⚠️  Skipping malformed line: " + line);
-                    stillFailing.add(line);
-                    continue;
-                }
-
-                String playerId = parts[0].trim();
-                String playerUserName = parts[1].trim();
-
-                // Skip if already scraped
-                if (status.isPlayerScraped(playerId)) {
-                    System.out.println("  ⏭️  Player " + playerId + " already scraped, skipping retry.");
-                    retrySuccess++;
-                    continue;
-                }
-
-                // Construct profile URL
-                String fullUrl = BASE + "/player/" + playerId + "/" + playerUserName;
-
-                System.out.println("  🔄 Retrying player: " + playerId + " (" + playerUserName + ")");
-
-                try {
-                    // Add delay to avoid rate limiting
-                    Thread.sleep(1000);
-
-                    PlayerProfile profile = ProfileScapper.getProfile(fullUrl, playerId);
-                    if (profile == null) {
-                        System.err.println("    ❌ Retry failed: profile is null for " + playerId);
-                        stillFailing.add(line);
-                        retryFailed++;
-                        continue;
-                    }
-
-                    // Build JSON object for this player
-                    LinkedHashMap<String, Object> obj = buildPlayerObject(profile, playerId, fullUrl, idToSlug);
-                    String objJson = gson.toJson(obj);
-
-                    // Append to JSONL file
-                    Files.writeString(profilesOut, objJson + System.lineSeparator(), StandardCharsets.UTF_8,
-                            StandardOpenOption.CREATE, StandardOpenOption.APPEND);
-
-                    // Append to JSON array file
-                    appendObjectToJsonArray(exportOut, objJson);
-
-                    // Mark as successfully scraped
-                    status.markPlayerScraped(playerId);
-
-                    System.out.println("    ✓ Retry successful for player " + playerId);
-                    retrySuccess++;
-
-                } catch (Exception ex) {
-                    System.err.println("    ❌ Retry failed for " + playerId + ": " + ex.getMessage());
-                    stillFailing.add(line);
-                    retryFailed++;
-                }
-            }
-
-            System.out.println("\n[RETRY SUMMARY]");
-            System.out.println("  ✓ Successful retries: " + retrySuccess);
-            System.out.println("  ❌ Still failing: " + retryFailed);
-
-            // Update failed_players.txt with only the players that still failed
-            if (stillFailing.isEmpty()) {
-                Files.deleteIfExists(failedFile);
-                System.out.println("  🗑️  All failures resolved! Deleted failed_players.txt");
-            } else {
-                Files.write(failedFile, stillFailing, StandardCharsets.UTF_8,
-                        StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
-                System.out.println("  📝 Updated failed_players.txt with " + stillFailing.size() + " remaining failures");
-            }
-
-        } catch (Exception ex) {
-            System.err.println("Error during failed player retry: " + ex.getMessage());
-            ex.printStackTrace();
-        }
+        // Retry logic removed as per new requirements: no retry, just log failed URLs.
     }
 
     // All static methods below remain inside the class

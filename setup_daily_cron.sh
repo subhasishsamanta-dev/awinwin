@@ -3,6 +3,8 @@
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 WRAPPER_SCRIPT="$SCRIPT_DIR/run_daily_extraction_with_upload.sh"
+CRON_TAG_BEGIN="# >>> awinwin daily extraction (managed) >>>"
+CRON_TAG_END="# <<< awinwin daily extraction (managed) <<<"
 
 echo "=========================================="
 echo "Setting up Daily Cron Job"
@@ -13,13 +15,21 @@ echo ""
 chmod +x "$WRAPPER_SCRIPT"
 echo "✅ Made wrapper script executable"
 
-# Remove existing cron jobs for this project
-crontab -l 2>/dev/null | grep -v "run_daily_extraction" | crontab -
-echo "✅ Removed old cron jobs"
+# Remove existing managed block and install a fresh one
+CURRENT_CRON="$(crontab -l 2>/dev/null || true)"
+CLEAN_CRON="$(printf "%s\n" "$CURRENT_CRON" \
+  | sed "/$CRON_TAG_BEGIN/,/$CRON_TAG_END/d" \
+  | grep -v "run_daily_extraction_with_upload.sh" || true)"
 
-# Add new cron job: Run daily at 12:00 AM (midnight)
-(crontab -l 2>/dev/null; echo "0 0 * * * $WRAPPER_SCRIPT") | crontab -
-echo "✅ Installed new cron job"
+{
+  printf "%s\n" "$CLEAN_CRON"
+  echo "$CRON_TAG_BEGIN"
+  echo "SHELL=/bin/bash"
+  echo "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  echo "0 0 * * * /bin/bash \"$WRAPPER_SCRIPT\""
+  echo "$CRON_TAG_END"
+} | crontab -
+echo "✅ Installed/updated managed cron block"
 
 echo ""
 echo "=========================================="

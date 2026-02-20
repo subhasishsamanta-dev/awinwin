@@ -74,17 +74,21 @@ public class TableScapper {
         // Write CSV header if file doesn't exist
         writeCSVHeaderIfNeeded();
 
-        // --- LOGIN AND GET TOKENS ---
+        // --- ALWAYS LOGIN FRESH AT START OF EACH SCRAPE RUN ---
+        System.out.println("  🔑 Logging in to EliteProspects for fresh session...");
         JsonObject loginResp = EliteProspectsAPI.loginAndGetTokens(email, password);
+        
         // Extract tokens and build cookie string
         String token = loginResp.has("token") ? loginResp.get("token").getAsString() : null;
         String streamToken = loginResp.has("streamToken") ? loginResp.get("streamToken").getAsString() : null;
-        // You may need to add more cookies/headers as required by the site
+        
+        // Build cookie string
         StringBuilder cookieBuilder = new StringBuilder();
         if (token != null) cookieBuilder.append("ep_next_token=").append(token).append(";");
         if (streamToken != null) cookieBuilder.append("streamToken=").append(streamToken).append(";");
-        // Add any other static or required cookies here if needed
         String dynamicCookies = cookieBuilder.toString();
+        
+        System.out.println("  ✅ Login successful - using fresh cookies for this scrape session");
 
         java.util.concurrent.ExecutorService executor = java.util.concurrent.Executors.newFixedThreadPool(8); // 8 threads
         Object csvLock = new Object();
